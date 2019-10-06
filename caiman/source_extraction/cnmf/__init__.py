@@ -12,4 +12,6 @@ from . import temporal
 from . import oasis
 from . import params
 from . import online_cnmf
+from . import online_cnmf_TB
+from . import timebuffer
 from .cnmf import CNMF as CNMF

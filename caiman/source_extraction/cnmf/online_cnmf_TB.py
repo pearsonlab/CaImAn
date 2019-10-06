@@ -52,6 +52,8 @@ from ...components_evaluation import compute_event_exceptionality
 from ...motion_correction import motion_correct_iteration_fast, tile_and_correct
 from ...utils.utils import save_dict_to_hdf5, load_dict_from_hdf5, load_graph
 
+from .timebuffer import copy_arr, update_cy, compute_slice
+
 try:
     cv2.setNumThreads(0)
 except():
@@ -85,6 +87,7 @@ class OnACID(object):
     """
 
     def __init__(self, params=None, estimates=None):
+        print('Using TB!')
         if params is None:
             self.params = CNMFParams()
         else:
@@ -186,7 +189,7 @@ class OnACID(object):
         self.estimates.CY, self.estimates.CC = self.estimates.CY * 1. / self.params.get('online', 'init_batch'), 1 * self.estimates.CC / self.params.get('online', 'init_batch')
 
         print('Expecting ' + str(expected_comps) + ' components')
-        self.estimates.CY.resize([expected_comps + self.params.get('init', 'nb'), self.estimates.CY.shape[-1]])
+        self.estimates.CY.resize([expected_comps + self.params.get('init', 'nb'), self.estimates.CY.shape[-1]], refcheck=False)
         if self.params.get('online', 'use_dense'):
             self.estimates.Ab_dense = np.zeros((self.estimates.CY.shape[-1], expected_comps + self.params.get('init', 'nb')),
                                      dtype=np.float32)
@@ -217,7 +220,7 @@ class OnACID(object):
             min(self.params.get('online', 'init_batch'), self.params.get('online', 'minibatch_shape')) - 1), 0)
         self.estimates.groups = list(map(list, update_order(self.estimates.Ab)[0]))
         
-        self.window = 1000
+        self.window = 100
         self.estimates.C_on = self.estimates.C_on[:, :self.window] #np.asfortranarray(self.estimates.C_on[:, :self.window])
         self.estimates.C_on = TimeBuffer(self.estimates.C_on, self.window)
         self.estimates.noisyC = TimeBuffer(self.estimates.noisyC[:, :self.window], self.window)
@@ -303,26 +306,76 @@ class OnACID(object):
         if len(self.estimates.ind_new) > 0:
             self.estimates.mean_buff = self.estimates.Yres_buf.mean(0)
 
+        sl = np.zeros((2, 2), dtype=np.int64)
         if (not self.params.get('online', 'simultaneously')) or self.params.get('preprocess', 'p') == 0:
             # get noisy fluor value via NNLS (project data on shapes & demix)
             C_in = self.estimates.noisyC[:self.M, (t - 1)%self.window].copy()
             self.estimates.C_on[:self.M, t%self.window], self.estimates.noisyC[:self.M, t%self.window] = HALS4activity(
                 frame, self.estimates.Ab, C_in, self.estimates.AtA, iters=num_iters_hals, groups=self.estimates.groups)
 
+            # def test_sl(sl, max_):
+            #     start = sl[0, 0]
+            #     stop = sl[0, 1]
+            #
+            #     if stop < max_:
+            #         pass
+            #
+            #     elif start and start >= max_:
+            #        n = stop - start
+            #        mod_start = start % max_
+            #        if mod_start + n >= max_:
+            #            sl[0, 0] = mod_start
+            #            sl[0, 1] = max_
+            #            sl[1, 0] = 0
+            #            sl[1, 1] = n - (max_-mod_start)
+            #
+            #        else:
+            #            sl[0, 0] = mod_start
+            #            sl[0, 1] = mod_start + n
+            #
+            #     else:
+            #         mod_stop = stop % max_
+            #         sl[0, 0] = start
+            #         sl[0, 1] = max_
+            #         sl[1, 0] = 0
+            #         sl[1, 1] = mod_stop
+            #     print(sl)
+            #
+            # def test(row, sl, tb, cp_from):
+            #     start = sl[0, 0]
+            #     stop = sl[0, 1]
+            #
+            #     for i in range(start, stop):
+            #         tb[row, i] = cp_from[i - start]  # View entire thing
+            #
+            #     if sl[1, 1] != -1:
+            #         if sl[1, 1] - sl[1, 0] > cp_from.shape[0]:
+            #             sl[1, 1] = sl[1, 0] + 100
+            #
+            #         for i in range(sl[1, 0], sl[1, 1]):
+            #             tb[row, i] = cp_from[i - sl[1, 0] + stop - start]
+
             if self.params.get('preprocess', 'p'):
                 # denoise & deconvolve
                 for i, o in enumerate(self.estimates.OASISinstances):
                     o.fit_next(self.estimates.noisyC[nb_ + i, t%self.window])
-                    inds = self.estimates.C_on.computeSlice(slice(t - o.get_l_of_last_pool() + 1, t + 1, None))
+                    # inds = self.estimates.C_on.computeSlice(slice(t - o.get_l_of_last_pool() + 1, t + 1, None))
+                    sl[0, :] = t - o.get_l_of_last_pool() + 1, t + 1
+                    sl[1, :] = -1, -1
                     last_c = o.get_c_of_last_pool()
-                    try:
-                        if isinstance(inds, list): #need to concatentate results
-                            self.estimates.C_on[nb_ + i, inds[0]] = last_c[:(inds[0].stop-inds[0].start)]
-                            self.estimates.C_on[nb_ + i, inds[1]] = last_c[(inds[0].stop-inds[0].start):]
-                        else: #indices as computed are now continuous
-                            self.estimates.C_on[nb_ + i, inds] = last_c
-                    except:
-                        import pdb; pdb.set_trace()
+                    copy_arr(nb_ + i, sl, self.estimates.C_on.max_, self.estimates.C_on, last_c, True)
+
+                    # try:
+                    #     if isinstance(inds, list): #need to concatentate results
+                    #         self.estimates.C_on[nb_ + i, inds[0]] = last_c[:(inds[0].stop-inds[0].start)]
+                    #         self.estimates.C_on[nb_ + i, inds[1]] = last_c[(inds[0].stop-inds[0].start):]
+                    #     else: #indices as computed are now continuous
+                    #         self.estimates.C_on[nb_ + i, inds] = last_c
+                    #         # copy_arr(nb_ + i, inds.start, inds.stop,
+                    #         #          self.estimates.C_on, last_c)
+                    # except:
+                    #     pass
+
         else:
             # update buffer, initialize C with previous value
             self.estimates.C_on[:, t%self.window] = self.estimates.C_on[:, (t - 1)%self.window]
@@ -333,12 +386,11 @@ class OnACID(object):
             inds = self.estimates.C_on.computeSlice(slice(t - mbs + 1, t + 1, None))
             
             if isinstance(inds, list):
-                (C_on, noisyC_tmp,
-                self.estimates.OASISinstances) = demix_and_deconvolve(
-                np.concatenate([self.estimates.C_on[:self.M, inds[0]], self.estimates.C_on[:self.M, inds[1]]], axis=1),
-                np.concatenate([self.estimates.noisyC[:self.M, inds[0]], self.estimates.noisyC[:self.M, inds[1]]], axis=1),
-                self.estimates.AtY_buf, self.estimates.AtA, self.estimates.OASISinstances, iters=num_iters_hals,
-                n_refit=self.params.get('online', 'n_refit'))
+                (C_on, noisyC_tmp, self.estimates.OASISinstances) = demix_and_deconvolve(
+                    np.concatenate([self.estimates.C_on[:self.M, inds[0]], self.estimates.C_on[:self.M, inds[1]]], axis=1),
+                    np.concatenate([self.estimates.noisyC[:self.M, inds[0]], self.estimates.noisyC[:self.M, inds[1]]], axis=1),
+                    self.estimates.AtY_buf, self.estimates.AtA, self.estimates.OASISinstances, iters=num_iters_hals,
+                    n_refit=self.params.get('online', 'n_refit'))
             
                 self.estimates.noisyC[:self.M, inds[0]] = noisyC_tmp[:, :(inds[0].stop-inds[0].start)]
                 self.estimates.noisyC[:self.M, inds[1]] = noisyC_tmp[:, (inds[0].stop-inds[0].start):]
@@ -347,22 +399,24 @@ class OnACID(object):
                 self.estimates.C_on[:self.M, inds[1]] = C_on[:, (inds[0].stop-inds[0].start):]
                 
             else:
-                (self.estimates.C_on[:self.M, inds], self.estimates.noisyC[:self.M, inds],
-                self.estimates.OASISinstances) = demix_and_deconvolve(
-                self.estimates.C_on[:self.M, inds],
-                self.estimates.noisyC[:self.M, inds],
-                self.estimates.AtY_buf, self.estimates.AtA, self.estimates.OASISinstances, iters=num_iters_hals,
-                n_refit=self.params.get('online', 'n_refit'))
+                (self.estimates.C_on[:self.M, inds], self.estimates.noisyC[:self.M, inds], self.estimates.OASISinstances) = demix_and_deconvolve(
+                    self.estimates.C_on[:self.M, inds],
+                    self.estimates.noisyC[:self.M, inds],
+                    self.estimates.AtY_buf, self.estimates.AtA, self.estimates.OASISinstances, iters=num_iters_hals,
+                    n_refit=self.params.get('online', 'n_refit'))
 
             for i, o in enumerate(self.estimates.OASISinstances):
                 #self.estimates.C_on[nb_ + i, t - o.get_l_of_last_pool() + 1: t + 1] = o.get_c_of_last_pool()
-                inds = self.estimates.C_on.computeSlice(slice(t - o.get_l_of_last_pool() + 1, t + 1, None))
+                # inds = self.estimates.C_on.computeSlice(slice(t - o.get_l_of_last_pool() + 1, t + 1, None))
+                sl[0, :] = t - o.get_l_of_last_pool() + 1, t + 1
+                sl[1, :] = -1, -1
                 last_c = o.get_c_of_last_pool()
-                if isinstance(inds, list): #need to concatentate results
-                    self.estimates.C_on[nb_ + i, inds[0]] = last_c[:, :(inds[0].stop-inds[0].start)]
-                    self.estimates.C_on[nb_ + i, inds[1]] = last_c[:, (inds[0].stop-inds[0].start):]
-                else: #indices as computed are now continuous
-                    self.estimates.C_on[nb_ + i, inds] = last_c
+                copy_arr(nb_ + i, sl, self.estimates.C_on.max_, self.estimates.C_on, last_c, True)
+                # if isinstance(inds, list): #need to concatentate results
+                #     self.estimates.C_on[nb_ + i, inds[0]] = last_c[:, :(inds[0].stop-inds[0].start)]
+                #     self.estimates.C_on[nb_ + i, inds[1]] = last_c[:, (inds[0].stop-inds[0].start):]
+                # else: #indices as computed are now continuous
+                #     self.estimates.C_on[nb_ + i, inds] = last_c
 
         #self.estimates.mean_buff = self.estimates.Yres_buf.mean(0)
         res_frame = frame - self.estimates.Ab.dot(self.estimates.C_on[:self.M, t%self.window])
@@ -428,14 +482,14 @@ class OnACID(object):
                     expected_comps += 200
                     self.params.set('online', {'expected_comps': expected_comps})
                     self.estimates.CY.resize(
-                        [expected_comps + nb_, self.estimates.CY.shape[-1]])
+                        [expected_comps + nb_, self.estimates.CY.shape[-1]], refcheck=False)
                     # refcheck can trigger "ValueError: cannot resize an array references or is referenced
                     #                       by another array in this way.  Use the resize function"
                     # np.resize didn't work, but refcheck=False seems fine
                     np.resize(self.estimates.C_on, 
-                        [expected_comps + nb_, self.estimates.C_on.shape[-1]])
+                        [expected_comps + nb_, self.estimates.C_on.shape[-1]], refcheck=False)
                     np.resize(self.estimates.noisyC,
-                        [expected_comps + nb_, self.estimates.noisyC.shape[-1]])
+                        [expected_comps + nb_, self.estimates.noisyC.shape[-1]], refcheck=False)
                     if self.params.get('online', 'use_dense'):  # resize won't work due to contingency issue
                         # self.estimates.Ab_dense.resize([self.estimates.CY.shape[-1], expected_comps+nb_])
                         self.estimates.Ab_dense = np.zeros((self.estimates.CY.shape[-1], expected_comps + nb_),
@@ -443,7 +497,7 @@ class OnACID(object):
                         self.estimates.Ab_dense[:, :Ab_.shape[1]] = Ab_.toarray()
                     print('Increasing number of expected components to:' +
                           str(expected_comps))
-                self.update_counter.resize(self.N)
+                self.update_counter.resize(self.N, refcheck=False)
 
                 inds = self.estimates.C_on.computeSlice(slice(t - mbs + 1, t + 1, None))
                 if isinstance(inds, list):
@@ -517,8 +571,7 @@ class OnACID(object):
                 w2 = 1. / (t + t0)  # 1.*mbs /t
                 for m in range(self.N):
                     self.estimates.CY[m + nb_, self.ind_A[m]] *= w1
-                    self.estimates.CY[m + nb_, self.ind_A[m]] += w2 * \
-                        ccf[m + nb_].dot(y[:, self.ind_A[m]])
+                    self.estimates.CY[m + nb_, self.ind_A[m]] += w2 * ccf[m + nb_].dot(y[:, self.ind_A[m]])
 
                 self.estimates.CY[:nb_] = self.estimates.CY[:nb_] * w1 + \
                     w2 * ccf[:nb_].dot(y)   # background
@@ -534,10 +587,40 @@ class OnACID(object):
                                       
             y = self.estimates.Yr_buf.get_last_frames(self.params.get('online', 'minibatch_suff_stat') + 1)[:1]
             # much faster: exploit that we only access CY[m, ind_pixels], hence update only these
-            for m in range(self.N):
-                self.estimates.CY[m + nb_, self.ind_A[m]] *= (1 - 1. / t)
-                self.estimates.CY[m + nb_, self.ind_A[m]] += ccf[m +
-                                                       nb_].dot(y[:, self.ind_A[m]]) / t
+            # migrate to Cython
+            # if self.estimates.Ab.shape[-1] > 100:  # Start pdb
+            #     raise Exception
+
+            idx = np.cumsum(np.array([0] + [len(x) for x in self.ind_A]))
+            ind_A_concat = np.concatenate(self.ind_A).astype(np.int)
+            update_cy(self.estimates.CY, ind_A_concat, idx, ccf, y, self.N, nb_, t)
+
+            # N = self.N
+            # ind_A = ind_A_concat
+            # cy = self.estimates.CY.copy()
+            # for m in range(N):
+            #     for i in range(idx[m], idx[m + 1]):
+            #         cy[m + nb_, ind_A[i]] *= (1 - 1. / t)
+            #
+            #     for i in range(idx[m], idx[m + 1]):
+            #         cy[m + nb_, ind_A[i]] += ccf[m + nb_, 0] * y[0, ind_A[i]] / t
+
+            # for m in range(self.N):
+            #     self.estimates.CY[m + nb_, self.ind_A[m]] *= (1 - 1. / t)
+            #     self.estimates.CY[m + nb_, self.ind_A[m]] += ccf[m + nb_].dot(y[:, self.ind_A[m]]) / t
+
+            # assert np.all(np.isclose(self.estimates.CY, cy))
+            # import pickle
+            # with open('cy.pk', 'wb') as f:
+            #     pickle.dump([self.estimates.CY, ind_A_concat, self.ind_A, idx, ccf, y, self.N, nb_, t], f)
+
+            # cy = self.estimates.CY.copy()
+            # cy_col = cy.shape[1]
+            # for i in range(nb_):
+            #     for j in range(cy_col):
+            #         cy[i, j] = cy[i, j] * (1 - 1. / t) + ccf[i] * y[0, j] / t
+            # assert np.all(np.isclose(self.estimates.CY, cy))
+
             self.estimates.CY[:nb_] = self.estimates.CY[:nb_] * (1 - 1. / t) + ccf[:nb_].dot(y / t)
             self.estimates.CC = self.estimates.CC * (1 - 1. / t) + ccf.dot(ccf.T / t)
 
@@ -911,6 +994,10 @@ class OnACID(object):
         self.estimates.C_on = self.estimates.C_on[:self.M, :]
         self.estimates.noisyC = self.estimates.noisyC[:self.M]
 
+        import pickle
+        with open('tb.pk', 'wb') as f:
+            pickle.dump([self.t_detect, self.t_motion, self.t_online, self.t_shapes], f)
+
         return self
 
     def create_frame(self, frame_cor, show_residuals=True, resize_fact=1):
@@ -1133,7 +1220,7 @@ def seeded_initialization(Y, Ain, dims=None, init_batch=1000, order_init=None, g
     else:
         return Ain, np.array(b_in), Cin, f_in, YrA
 
-@profile
+
 def HALS4shapes(Yr, A, C, iters=2):
     K = A.shape[-1]
     ind_A = A > 0
@@ -1151,7 +1238,7 @@ def HALS4shapes(Yr, A, C, iters=2):
 
 
 # definitions for demixed time series extraction and denoising/deconvolving
-@profile
+
 def HALS4activity(Yr, A, noisyC, AtA=None, iters=5, tol=1e-3, groups=None,
                   order=None):
     """Solves C = argmin_C ||Yr-AC|| using block-coordinate decent. Can use
@@ -1217,7 +1304,7 @@ def HALS4activity(Yr, A, noisyC, AtA=None, iters=5, tol=1e-3, groups=None,
     return C, noisyC
 
 
-@profile
+
 def demix_and_deconvolve(C, noisyC, AtY, AtA, OASISinstances, iters=3, n_refit=0):
     """
     Solve C = argmin_C ||Y-AC|| subject to C following AR(p) dynamics
@@ -1327,7 +1414,7 @@ def init_shapes_and_sufficient_stats(Y, A, C, b, f, bSiz=3):
     return Ab, ind_A, CY, CC
 
 
-@profile
+
 def update_shapes(CY, CC, Ab, ind_A, sn=None, q=0.5, indicator_components=None,
                   Ab_dense=None, update_bkgrd=True, iters=5):
 
@@ -1425,7 +1512,7 @@ def update_shapes(CY, CC, Ab, ind_A, sn=None, q=0.5, indicator_components=None,
 class RingBuffer(np.ndarray):
     """ implements ring buffer efficiently"""
 
-    @profile
+
     def __new__(cls, input_array, num_els):
         obj = np.asarray(input_array).view(cls)
         obj.max_ = num_els
@@ -1436,7 +1523,7 @@ class RingBuffer(np.ndarray):
 
         return obj
 
-    @profile
+
     def __array_finalize__(self, obj):
         # see InfoArray.__array_finalize__ for comments
         if obj is None:
@@ -1445,20 +1532,20 @@ class RingBuffer(np.ndarray):
         self.max_ = getattr(obj, 'max_', None)
         self.cur = getattr(obj, 'cur', None)
 
-    @profile
+
     def append(self, x):
         self[self.cur] = x
         self.cur = (self.cur + 1) % self.max_
 
-    @profile
+
     def get_ordered(self):
         return np.concatenate([self[self.cur:], self[:self.cur]], axis=0)
 
-    @profile
+
     def get_first(self):
         return self[self.cur]
 
-    @profile
+
     def get_last_frames(self, num_frames):
         if self.cur >= num_frames:
             return self[self.cur - num_frames:self.cur]
@@ -1466,7 +1553,7 @@ class RingBuffer(np.ndarray):
             return np.concatenate([self[(self.cur - num_frames):], self[:self.cur]], axis=0)
 
 class TimeBuffer(np.ndarray):
-    @profile
+
     def __new__(cls, input_array, num_els):
         obj = np.asarray(input_array, order='F').view(cls)
         obj.max_ = num_els
@@ -1476,7 +1563,7 @@ class TimeBuffer(np.ndarray):
             raise Exception('The second dimension should equal num_els')
         return obj
 
-    @profile
+
     def __array_finalize__(self, obj):
         # see InfoArray.__array_finalize__ for comments
         if obj is None:
@@ -1484,20 +1571,20 @@ class TimeBuffer(np.ndarray):
         self.max_ = getattr(obj, 'max_', None)
         self.cur = getattr(obj, 'cur', None)
 
-    @profile
+
     def append(self, x):
         self[:, self.cur] = x
         self.cur = (self.cur + 1) % self.max_
 
-    @profile
+
     def get_ordered(self):
         return np.concatenate([self[:,self.cur:], self[:,:self.cur]], axis=1)
 
-    @profile
+
     def get_first(self):
         return self[:,self.cur]
 
-    @profile
+
     def computeSlice(self, slice_in):
         ''' Assuming we need to potentially recalc the time axis indices
             This also assumes we only ever loop once over the matrix
@@ -1506,19 +1593,19 @@ class TimeBuffer(np.ndarray):
         if slice_in.stop < self.max_:
             slice_out = slice_in
         elif slice_in.start and slice_in.start>= self.max_: #loop starting index
-            number = slice_in.stop - slice_in.start #number of frames to extract
-            start = slice_in.start % self.max_
-            if start + number >= self.max_:
+            n = slice_in.stop - slice_in.start #number of frames to extract
+            mod_start = slice_in.start % self.max_
+            if mod_start + n >= self.max_:
                 # Need to concatentate
-                index1 = slice(start, self.max_, None) #go to end
-                index2 = slice(0, number-(self.max_-start), None)
+                index1 = slice(mod_start, self.max_, None) #go to end
+                index2 = slice(0, n-(self.max_-mod_start), None)
                 slice_out = [index1, index2]
             else: #straight shot now
-                slice_out = slice(start, start+number, None)
+                slice_out = slice(mod_start, mod_start+n, None)
         else: #loop ending index
-            stop = slice_in.stop % self.max_
+            mod_stop = slice_in.stop % self.max_
             index1 = slice(slice_in.start, self.max_, None) #go to end
-            index2 = slice(0, stop, None)
+            index2 = slice(0, mod_stop, None)
             slice_out = [index1, index2]
         #print('Slice in/out: ', slice_in, slice_out)
         return slice_out
@@ -1558,7 +1645,7 @@ class TimeBuffer(np.ndarray):
     #     else:
     #         return np.ndarray.__getitem__(self, index)
             
-    @profile
+
     def set_cur(self, t):
         # only used after init to set frame number? 
         # TODO: check behavior with missed frames. Need to append blank I think
@@ -1576,7 +1663,7 @@ def csc_append(a, b):
     a.indptr = np.concatenate((a.indptr, (b.indptr + a.nnz)[1:]))
     a._shape = (a.shape[0], a.shape[1] + b.shape[1])
 
-@profile
+
 def corr(a, b):
     """
     faster correlation than np.corrcoef, especially for smaller arrays
@@ -1586,7 +1673,7 @@ def corr(a, b):
     b -= b.mean()
     return a.dot(b) / sqrt(a.dot(a) * b.dot(b) + np.finfo(float).eps)
 
-@profile
+
 def rank1nmf(Ypx, ain):
     """
     perform a fast rank 1 NMF
@@ -1612,7 +1699,7 @@ def rank1nmf(Ypx, ain):
 
 
 #%%
-@profile
+
 def get_candidate_components(sv, dims, Yres_buf, min_num_trial=3, gSig=(5, 5),
                              gHalf=(5, 5), sniper_mode=True, rval_thr=0.85,
                              patch_size=50, loaded_model=None, test_both=False,
@@ -1763,7 +1850,7 @@ def get_candidate_components(sv, dims, Yres_buf, min_num_trial=3, gSig=(5, 5),
 
 
 #%%
-@profile
+
 def update_num_components(t, sv, Ab, Cf, Yres_buf, Y_buf, rho_buf,
                           dims, gSig, gSiz, ind_A, CY, CC, groups, oases, gnb=1,
                           rval_thr=0.875, bSiz=3, robust_std=False,
@@ -1977,7 +2064,7 @@ def update_num_components(t, sv, Ab, Cf, Yres_buf, Y_buf, rho_buf,
 
 
 #%% remove components online
-@profile
+
 def remove_components_online(ind_rem, gnb, Ab, use_dense, Ab_dense, AtA, CY,
                              CC, M, N, noisyC, OASISinstances, C_on, exp_comps):
 
