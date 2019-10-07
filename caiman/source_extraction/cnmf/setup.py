@@ -8,7 +8,7 @@ import numpy
 extensions = [
     Extension("timebuffer", ["timebuffer.pyx"],
               include_dirs=[numpy.get_include()],
-              libraries=['cblas', 'blas', 'lapack']
+              # libraries=['cblas', 'blas', 'lapack']
               )
 ]
 setup(
