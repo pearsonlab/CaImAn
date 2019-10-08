@@ -6,12 +6,14 @@ from Cython.Build import cythonize
 import numpy
 
 extensions = [
-    Extension("timebuffer", ["timebuffer.pyx"],
-              include_dirs=[numpy.get_include()],
-              # libraries=['cblas', 'blas', 'lapack']
-              )
+    Extension(
+        "timebuffer", ["timebuffer.pyx"],
+        include_dirs=[numpy.get_include()],
+        extra_compile_args=['-O2', '-march=native'],
+        extra_link_args=['-O2', '-march=native']
+    )
 ]
-setup(
-    ext_modules=cythonize(extensions),
 
+setup(
+    ext_modules=cythonize(extensions)
 )

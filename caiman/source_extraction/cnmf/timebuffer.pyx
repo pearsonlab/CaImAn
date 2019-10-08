@@ -39,6 +39,9 @@ cpdef compute_slice(np.int64_t[:, ::] sl, int max_):
         sl[1, 0] = 0
         sl[1, 1] = mod_stop
 
+@cython.cdivision(True)
+@cython.boundscheck(False)
+@cython.wraparound(False)
 cpdef copy_arr(np.intp_t row, np.int64_t[:, ::] sl, int max_,
                 float[::, :] tb, float[::] cp_from, bint compute):
 
@@ -63,7 +66,7 @@ cpdef copy_arr(np.intp_t row, np.int64_t[:, ::] sl, int max_,
 @cython.cdivision(True)
 @cython.boundscheck(False)
 @cython.wraparound(False)
-cpdef update_cy(float[:, ::] cy, np.int64_t[::] ind_A, np.int64_t[::] idx, float[::,:] ccf,
+cpdef update_cy(float[:, ::] cy, np.int64_t[::] ind_A, np.int64_t[::] idx, float[::, :] ccf,
                 float[:, ::] y, np.int64_t N, np.int64_t nb_, float t):
 
     cdef np.intp_t m, i
