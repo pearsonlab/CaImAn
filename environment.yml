@@ -1,20 +1,20 @@
 channels:
 - conda-forge
 dependencies:
-- python=3.6
+- python=3.7
 - tensorflow # Must list before keras to preempt default keras backend
 - bokeh
 - cython
 - future
 - h5py
-- ipykernel=4.10
+- ipykernel
 - ipython
 - ipyparallel
 - jupyter
 - matplotlib
 - mypy
 - nose
-- numpy
+- numpy==1.16
 - opencv
 - peakutils
 - pims
