@@ -18,7 +18,6 @@ imaging data in real time. In Advances in Neural Information Processing Systems
 # import atexit
 # profile = line_profiler.LineProfiler()
 # atexit.register(profile.print_stats)
-import sys
 
 from builtins import map
 from builtins import range
@@ -120,6 +119,7 @@ class OnACID(object):
             self.params.set('online', {'expected_comps': expected_comps})
 
         if Yr.shape[-1] != self.params.get('online', 'init_batch'):
+            print('Yr shape is ', Yr.shape[-1])
             raise Exception(
                 'The movie size used for initialization does not match with the minibatch size')
 
@@ -216,12 +216,6 @@ class OnACID(object):
         self.estimates.sv = np.sum(self.estimates.rho_buf.get_last_frames(
             min(self.params.get('online', 'init_batch'), self.params.get('online', 'minibatch_shape')) - 1), 0)
         self.estimates.groups = list(map(list, update_order(self.estimates.Ab)[0]))
-        
-        self.window = 1000
-        self.estimates.C_on = self.estimates.C_on[:, :self.window] #np.asfortranarray(self.estimates.C_on[:, :self.window])
-        self.estimates.C_on = TimeBuffer(self.estimates.C_on, self.window)
-        self.estimates.noisyC = TimeBuffer(self.estimates.noisyC[:, :self.window], self.window)
-        
         self.update_counter = 2**np.linspace(0, 1, self.N, dtype=np.float32)
         self.time_neuron_added:List = []
         for nneeuu in range(self.N):
@@ -297,75 +291,40 @@ class OnACID(object):
         frame = frame_in.astype(np.float32)
 #        print(np.max(1/scipy.sparse.linalg.norm(self.estimates.Ab,axis = 0)))
         self.estimates.Yr_buf.append(frame)
-
-        self.estimates.C_on.set_cur(t)
-
         if len(self.estimates.ind_new) > 0:
             self.estimates.mean_buff = self.estimates.Yres_buf.mean(0)
 
         if (not self.params.get('online', 'simultaneously')) or self.params.get('preprocess', 'p') == 0:
             # get noisy fluor value via NNLS (project data on shapes & demix)
-            C_in = self.estimates.noisyC[:self.M, (t - 1)%self.window].copy()
-            self.estimates.C_on[:self.M, t%self.window], self.estimates.noisyC[:self.M, t%self.window] = HALS4activity(
+            C_in = self.estimates.noisyC[:self.M, t - 1].copy()
+            self.estimates.C_on[:self.M, t], self.estimates.noisyC[:self.M, t] = HALS4activity(
                 frame, self.estimates.Ab, C_in, self.estimates.AtA, iters=num_iters_hals, groups=self.estimates.groups)
-
             if self.params.get('preprocess', 'p'):
                 # denoise & deconvolve
                 for i, o in enumerate(self.estimates.OASISinstances):
-                    o.fit_next(self.estimates.noisyC[nb_ + i, t%self.window])
-                    inds = self.estimates.C_on.computeSlice(slice(t - o.get_l_of_last_pool() + 1, t + 1, None))
-                    last_c = o.get_c_of_last_pool()
-                    try:
-                        if isinstance(inds, list): #need to concatentate results
-                            self.estimates.C_on[nb_ + i, inds[0]] = last_c[:(inds[0].stop-inds[0].start)]
-                            self.estimates.C_on[nb_ + i, inds[1]] = last_c[(inds[0].stop-inds[0].start):]
-                        else: #indices as computed are now continuous
-                            self.estimates.C_on[nb_ + i, inds] = last_c
-                    except:
-                        import pdb; pdb.set_trace()
+                    o.fit_next(self.estimates.noisyC[nb_ + i, t])
+                    self.estimates.C_on[nb_ + i, t - o.get_l_of_last_pool() +
+                              1: t + 1] = o.get_c_of_last_pool()
+
         else:
             # update buffer, initialize C with previous value
-            self.estimates.C_on[:, t%self.window] = self.estimates.C_on[:, (t - 1)%self.window]
-            self.estimates.noisyC[:, t%self.window] = self.estimates.C_on[:, (t - 1)%self.window]
+            self.estimates.C_on[:, t] = self.estimates.C_on[:, t - 1]
+            self.estimates.noisyC[:, t] = self.estimates.C_on[:, t - 1]
             self.estimates.AtY_buf = np.concatenate((self.estimates.AtY_buf[:, 1:], self.estimates.Ab.T.dot(frame)[:, None]), 1) \
                 if self.params.get('online', 'n_refit') else self.estimates.Ab.T.dot(frame)[:, None]
             # demix, denoise & deconvolve
-            inds = self.estimates.C_on.computeSlice(slice(t - mbs + 1, t + 1, None))
-            
-            if isinstance(inds, list):
-                (C_on, noisyC_tmp,
+            (self.estimates.C_on[:self.M, t + 1 - mbs:t + 1], self.estimates.noisyC[:self.M, t + 1 - mbs:t + 1],
                 self.estimates.OASISinstances) = demix_and_deconvolve(
-                np.concatenate([self.estimates.C_on[:self.M, inds[0]], self.estimates.C_on[:self.M, inds[1]]], axis=1),
-                np.concatenate([self.estimates.noisyC[:self.M, inds[0]], self.estimates.noisyC[:self.M, inds[1]]], axis=1),
+                self.estimates.C_on[:self.M, t + 1 - mbs:t + 1],
+                self.estimates.noisyC[:self.M, t + 1 - mbs:t + 1],
                 self.estimates.AtY_buf, self.estimates.AtA, self.estimates.OASISinstances, iters=num_iters_hals,
                 n_refit=self.params.get('online', 'n_refit'))
-            
-                self.estimates.noisyC[:self.M, inds[0]] = noisyC_tmp[:, :(inds[0].stop-inds[0].start)]
-                self.estimates.noisyC[:self.M, inds[1]] = noisyC_tmp[:, (inds[0].stop-inds[0].start):]
-
-                self.estimates.C_on[:self.M, inds[0]] = C_on[:, :(inds[0].stop-inds[0].start)]
-                self.estimates.C_on[:self.M, inds[1]] = C_on[:, (inds[0].stop-inds[0].start):]
-                
-            else:
-                (self.estimates.C_on[:self.M, inds], self.estimates.noisyC[:self.M, inds],
-                self.estimates.OASISinstances) = demix_and_deconvolve(
-                self.estimates.C_on[:self.M, inds],
-                self.estimates.noisyC[:self.M, inds],
-                self.estimates.AtY_buf, self.estimates.AtA, self.estimates.OASISinstances, iters=num_iters_hals,
-                n_refit=self.params.get('online', 'n_refit'))
-
             for i, o in enumerate(self.estimates.OASISinstances):
-                #self.estimates.C_on[nb_ + i, t - o.get_l_of_last_pool() + 1: t + 1] = o.get_c_of_last_pool()
-                inds = self.estimates.C_on.computeSlice(slice(t - o.get_l_of_last_pool() + 1, t + 1, None))
-                last_c = o.get_c_of_last_pool()
-                if isinstance(inds, list): #need to concatentate results
-                    self.estimates.C_on[nb_ + i, inds[0]] = last_c[:, :(inds[0].stop-inds[0].start)]
-                    self.estimates.C_on[nb_ + i, inds[1]] = last_c[:, (inds[0].stop-inds[0].start):]
-                else: #indices as computed are now continuous
-                    self.estimates.C_on[nb_ + i, inds] = last_c
+                self.estimates.C_on[nb_ + i, t - o.get_l_of_last_pool() + 1: t +
+                          1] = o.get_c_of_last_pool()
 
         #self.estimates.mean_buff = self.estimates.Yres_buf.mean(0)
-        res_frame = frame - self.estimates.Ab.dot(self.estimates.C_on[:self.M, t%self.window])
+        res_frame = frame - self.estimates.Ab.dot(self.estimates.C_on[:self.M, t])
         mn_ = self.estimates.mn.copy()
         self.estimates.mn = (t-1)/t*self.estimates.mn + res_frame/t
         self.estimates.vr = (t-1)/t*self.estimates.vr + (res_frame - mn_)*(res_frame - self.estimates.mn)/t
@@ -385,17 +344,11 @@ class OnACID(object):
             rho = np.reshape(rho, np.prod(self.params.get('data', 'dims')))
             self.estimates.rho_buf.append(rho)
 
-            inds = self.estimates.C_on.computeSlice(slice(t - mbs + 1, t + 1, None))
-            if isinstance(inds, list):
-                C_on_tmp = np.concatenate([self.estimates.C_on[:self.M, inds[0]], self.estimates.C_on[:self.M, inds[1]]], axis=1)
-            else:
-                C_on_tmp = self.estimates.C_on[:self.M, inds]
-
             (self.estimates.Ab, Cf_temp, self.estimates.Yres_buf, self.estimates.rho_buf,
                 self.estimates.CC, self.estimates.CY, self.ind_A, self.estimates.sv,
                 self.estimates.groups, self.estimates.ind_new, self.ind_new_all,
                 self.estimates.sv, self.cnn_pos) = update_num_components(
-                t, self.estimates.sv, self.estimates.Ab, C_on_tmp,
+                t, self.estimates.sv, self.estimates.Ab, self.estimates.C_on[:self.M, (t - mbs + 1):(t + 1)],
                 self.estimates.Yres_buf, self.estimates.Yr_buf, self.estimates.rho_buf,
                 self.params.get('data', 'dims'), self.params.get('init', 'gSig'),
                 self.params.get('init', 'gSiz'), self.ind_A, self.estimates.CY, self.estimates.CC,
@@ -432,10 +385,10 @@ class OnACID(object):
                     # refcheck can trigger "ValueError: cannot resize an array references or is referenced
                     #                       by another array in this way.  Use the resize function"
                     # np.resize didn't work, but refcheck=False seems fine
-                    np.resize(self.estimates.C_on, 
+                    self.estimates.C_on.resize(
+                        [expected_comps + nb_, self.estimates.C_on.shape[-1]], refcheck=False)
+                    self.estimates.noisyC.resize(
                         [expected_comps + nb_, self.estimates.C_on.shape[-1]])
-                    np.resize(self.estimates.noisyC,
-                        [expected_comps + nb_, self.estimates.noisyC.shape[-1]])
                     if self.params.get('online', 'use_dense'):  # resize won't work due to contingency issue
                         # self.estimates.Ab_dense.resize([self.estimates.CY.shape[-1], expected_comps+nb_])
                         self.estimates.Ab_dense = np.zeros((self.estimates.CY.shape[-1], expected_comps + nb_),
@@ -445,33 +398,18 @@ class OnACID(object):
                           str(expected_comps))
                 self.update_counter.resize(self.N)
 
-                inds = self.estimates.C_on.computeSlice(slice(t - mbs + 1, t + 1, None))
-                if isinstance(inds, list):
-                    self.estimates.noisyC[self.M - num_added:self.M, inds[0]] = Cf_temp[self.M - num_added:self.M, :(inds[0].stop-inds[0].start)]
-                    self.estimates.noisyC[self.M - num_added:self.M, inds[1]] = Cf_temp[self.M - num_added:self.M, (inds[0].stop-inds[0].start):]
-                else:
-                    self.estimates.noisyC[self.M - num_added:self.M, inds] = Cf_temp[self.M - num_added:self.M]
+                self.estimates.noisyC[self.M - num_added:self.M, t - mbs +
+                            1:t + 1] = Cf_temp[self.M - num_added:self.M]
 
                 for _ct in range(self.M - num_added, self.M):
                     self.time_neuron_added.append((_ct - nb_, t))
-                    inds = self.estimates.C_on.computeSlice(slice(t - mbs + 1, t + 1, None)) #TODO this is a common calc, precache
-                    if isinstance(inds, list):
-                        if self.params.get('preprocess', 'p'):
-                            # N.B. OASISinstances are already updated within update_num_components
-                            oa = self.estimates.OASISinstances[_ct - nb_].get_c(mbs)
-                            self.estimates.C_on[_ct, inds[0]] = oa[:(inds[0].stop-inds[0].start)]
-                            self.estimates.C_on[_ct, inds[1]] = oa[(inds[0].stop-inds[0].start):]
-                        else:
-                            ma = np.maximum(0, np.concatenate([self.estimates.noisyC[_ct, inds[0]], self.estimates.noisyC[_ct, inds[1]]], axis=1))
-                            self.estimates.C_on[_ct, inds[0]] = ma[:(inds[0].stop-inds[0].start)]
-                            self.estimates.C_on[_ct, inds[1]] = ma[(inds[0].stop-inds[0].start):]
+                    if self.params.get('preprocess', 'p'):
+                        # N.B. OASISinstances are already updated within update_num_components
+                        self.estimates.C_on[_ct, t - mbs + 1: t +
+                                  1] = self.estimates.OASISinstances[_ct - nb_].get_c(mbs)
                     else:
-                        if self.params.get('preprocess', 'p'):
-                            # N.B. OASISinstances are already updated within update_num_components
-                            self.estimates.C_on[_ct, inds] = self.estimates.OASISinstances[_ct - nb_].get_c(mbs)
-                        else:
-                            self.estimates.C_on[_ct, inds] = np.maximum(0, self.estimates.noisyC[_ct, inds])
-                                                                                
+                        self.estimates.C_on[_ct, t - mbs + 1: t + 1] = np.maximum(0,
+                                                                        self.estimates.noisyC[_ct, t - mbs + 1: t + 1])
                     if self.params.get('online', 'simultaneously') and self.params.get('online', 'n_refit'):
                         self.estimates.AtY_buf = np.concatenate((
                             self.estimates.AtY_buf, [Ab_.data[Ab_.indptr[_ct]:Ab_.indptr[_ct + 1]].dot(
@@ -501,11 +439,8 @@ class OnACID(object):
         # faster update using minibatch of frames
             min_batch = min(self.params.get('online', 'update_freq'), mbs)
             if ((t + 1 - self.params.get('online', 'init_batch')) % min_batch == 0):
-                inds = self.estimates.C_on.computeSlice(slice(t - min_batch + 1, t + 1, None))
-                if isinstance(inds, list):
-                    ccf = np.concatenate([self.estimates.C_on[:self.M, inds[0]], self.estimates.C_on[:self.M, inds[1]]], axis=1)
-                else:
-                    ccf = self.estimates.C_on[:self.M, inds]
+
+                ccf = self.estimates.C_on[:self.M, t - min_batch + 1:t + 1]
                 y = self.estimates.Yr_buf.get_last_frames(min_batch)
                 # ccf = self.estimates.C_on[:self.M, t - mbs + 1:t + 1]
                 # y = self.estimates.Yr_buf #.get_last_frames(mbs)
@@ -525,13 +460,9 @@ class OnACID(object):
                 self.estimates.CC = self.estimates.CC * w1 + w2 * ccf.dot(ccf.T)
 
         else:
-            inds = self.estimates.C_on.computeSlice(slice(t - self.params.get('online', 'minibatch_suff_stat'), t -
-                                      self.params.get('online', 'minibatch_suff_stat') + 1, None))
-            if isinstance(inds, list):
-                ccf = np.concatenate([self.estimates.C_on[:self.M, inds[0]], self.estimates.C_on[:self.M, inds[1]]], axis=1)
-            else:
-                ccf = self.estimates.C_on[:self.M, inds]
-                                      
+
+            ccf = self.estimates.C_on[:self.M, t - self.params.get('online', 'minibatch_suff_stat'):t -
+                                      self.params.get('online', 'minibatch_suff_stat') + 1]
             y = self.estimates.Yr_buf.get_last_frames(self.params.get('online', 'minibatch_suff_stat') + 1)[:1]
             # much faster: exploit that we only access CY[m, ind_pixels], hence update only these
             for m in range(self.N):
@@ -594,7 +525,7 @@ class OnACID(object):
                         del self.estimates.OASISinstances[ii - self.params.get('init', 'nb')]
                         #del self.ind_A[ii-self.params.init['nb']]
 
-                    self.estimates.C_on = np.delete(self.estimates.C_on, ind_zero, axis=0) #TODO CHECKME
+                    self.estimates.C_on = np.delete(self.estimates.C_on, ind_zero, axis=0)
                     self.estimates.AtY_buf = np.delete(self.estimates.AtY_buf, ind_zero, axis=0)
                     #Ab_ = Ab_[:,ind_keep]
                     Ab_ = csc_matrix(Ab_[:, ind_keep])
@@ -740,7 +671,7 @@ class OnACID(object):
         dims = Y.shape[1:]
         self.params.set('data', {'dims': dims})
         T1 = np.array(Ts).sum()*self.params.get('online', 'epochs')
-        T1 = 10000 #*= 10
+        T1 = 1500000 #*= 10
         print('T1 is ', T1)
         self._prepare_object(Yr, T1)
         if opts['show_movie']:
@@ -748,6 +679,8 @@ class OnACID(object):
                                         (0.001, 100-0.005))
             self.bnd_BG = np.percentile(self.estimates.b.dot(self.estimates.f),
                                         (0.001, 100-0.001))
+        S = np.stack([osi.s for osi in self.estimates.OASISinstances])
+        np.savetxt('S_init.txt', S)
         return self
 
     def save(self, filename):
@@ -764,7 +697,6 @@ class OnACID(object):
         else:
             raise Exception("Unsupported file extension")
 
-    @profile
     def fit_online(self, **kwargs):
         """Implements the caiman online algorithm on the list of files fls. The
         files are taken in alpha numerical order and are assumed to each have
@@ -852,7 +784,7 @@ class OnACID(object):
                     t_mot = time()    
                     if self.params.get('online', 'motion_correct'):    # motion correct
                         templ = self.estimates.Ab.dot(
-                            self.estimates.C_on[:self.M, (t-1)%self.window]).reshape(self.params.get('data', 'dims'), order='F')*self.img_norm
+                            self.estimates.C_on[:self.M, t-1]).reshape(self.params.get('data', 'dims'), order='F')*self.img_norm
                         if self.params.get('motion', 'pw_rigid'):
                             frame_cor1, shift = motion_correct_iteration_fast(
                                     frame_, templ, max_shifts_online, max_shifts_online)
@@ -889,14 +821,14 @@ class OnACID(object):
                     t += 1
                     t_online.append(time() - t_frame_start)
             self.Ab_epoch.append(self.estimates.Ab.copy())
-        if self.params.get('online', 'normalize'):
-            self.estimates.Ab /= 1./self.img_norm.reshape(-1, order='F')[:,np.newaxis]
-            self.estimates.Ab = csc_matrix(self.estimates.Ab)
+        # if self.params.get('online', 'normalize'):
+        #     self.estimates.Ab /= 1./self.img_norm.reshape(-1, order='F')[:,np.newaxis]
+        #     self.estimates.Ab = csc_matrix(self.estimates.Ab)
         self.estimates.A, self.estimates.b = self.estimates.Ab[:, self.params.get('init', 'nb'):], self.estimates.Ab[:, :self.params.get('init', 'nb')].toarray()
         self.estimates.C, self.estimates.f = self.estimates.C_on[self.params.get('init', 'nb'):self.M, t - t //
                          epochs:t], self.estimates.C_on[:self.params.get('init', 'nb'), t - t // epochs:t]
         noisyC = self.estimates.noisyC[self.params.get('init', 'nb'):self.M, t - t // epochs:t]
-        self.estimates.YrA = noisyC[:,:self.estimates.C.shape[1]] - self.estimates.C
+        self.estimates.YrA = noisyC - self.estimates.C
         if self.estimates.OASISinstances is not None:
             self.estimates.bl = [osi.b for osi in self.estimates.OASISinstances]
             self.estimates.S = np.stack([osi.s for osi in self.estimates.OASISinstances])
@@ -908,7 +840,7 @@ class OnACID(object):
         if self.params.get('online', 'show_movie'):
             cv2.destroyAllWindows()
         self.t_online = t_online
-        self.estimates.C_on = self.estimates.C_on[:self.M, :]
+        self.estimates.C_on = self.estimates.C_on[:self.M]
         self.estimates.noisyC = self.estimates.noisyC[:self.M]
 
         return self
@@ -1464,105 +1396,6 @@ class RingBuffer(np.ndarray):
             return self[self.cur - num_frames:self.cur]
         else:
             return np.concatenate([self[(self.cur - num_frames):], self[:self.cur]], axis=0)
-
-class TimeBuffer(np.ndarray):
-    @profile
-    def __new__(cls, input_array, num_els):
-        obj = np.asarray(input_array, order='F').view(cls)
-        obj.max_ = num_els
-        obj.cur = 0
-        if input_array.shape[1] != num_els:
-            print([input_array.shape[1], num_els])
-            raise Exception('The second dimension should equal num_els')
-        return obj
-
-    @profile
-    def __array_finalize__(self, obj):
-        # see InfoArray.__array_finalize__ for comments
-        if obj is None:
-            return
-        self.max_ = getattr(obj, 'max_', None)
-        self.cur = getattr(obj, 'cur', None)
-
-    @profile
-    def append(self, x):
-        self[:, self.cur] = x
-        self.cur = (self.cur + 1) % self.max_
-
-    @profile
-    def get_ordered(self):
-        return np.concatenate([self[:,self.cur:], self[:,:self.cur]], axis=1)
-
-    @profile
-    def get_first(self):
-        return self[:,self.cur]
-
-    @profile
-    def computeSlice(self, slice_in):
-        ''' Assuming we need to potentially recalc the time axis indices
-            This also assumes we only ever loop once over the matrix
-        '''
-        #import pdb; pdb.set_trace()
-        if slice_in.stop < self.max_:
-            slice_out = slice_in
-        elif slice_in.start and slice_in.start>= self.max_: #loop starting index
-            number = slice_in.stop - slice_in.start #number of frames to extract
-            start = slice_in.start % self.max_
-            if start + number >= self.max_:
-                # Need to concatentate
-                index1 = slice(start, self.max_, None) #go to end
-                index2 = slice(0, number-(self.max_-start), None)
-                slice_out = [index1, index2]
-            else: #straight shot now
-                slice_out = slice(start, start+number, None)
-        else: #loop ending index
-            stop = slice_in.stop % self.max_
-            index1 = slice(slice_in.start, self.max_, None) #go to end
-            index2 = slice(0, stop, None)
-            slice_out = [index1, index2]
-        #print('Slice in/out: ', slice_in, slice_out)
-        return slice_out
-
-    # @profile
-    # def get_last_frames(self, num_frames):
-    #     if self.cur >= num_frames:
-    #         index = (slice(None, None, None), slice(self.cur-num_frames, self.cur, None))
-    #         return np.ndarray.__getitem__(self, index)
-    #         #return self[:,self.cur - num_frames:self.cur]
-    #     else:
-    #         return np.concatenate([self[:,(self.cur - num_frames):], self[:,:self.cur]], axis=1)
-
-    # @profile
-    # def __getitem__(self, index):
-    #     ''' Checks for looping around 2nd dimension for Fortran ordering
-    #     '''
-    #     #print('index ', index)
-    #     if isinstance(index, tuple) and len(index)==2:
-    #         i0 = index[0] #num comp
-    #         i1 = index[1] #time
-    #         if isinstance(i1,slice): #possible we need to loop indices here
-    #             if i1.stop is None:
-    #                 return np.ndarray.__getitem__(self, index)
-    #             else: 
-    #                 #print('first index is: ', i1)
-    #                 #import pdb; pdb.set_trace()
-    #                 self.cur = i1.stop % self.max_
-    #                 start = 0 if i1.start is None else i1.start
-    #                 return self.get_last_frames(i1.stop - start)[i0,:]
-    #         elif i1 is not None and i1 >= self.max_:
-    #             i1 = i1 % self.max_
-    #             index2 = (i0, i1)
-    #             return np.ndarray.__getitem__(self, index2)
-    #         else:
-    #             return np.ndarray.__getitem__(self, index)
-    #     else:
-    #         return np.ndarray.__getitem__(self, index)
-            
-    @profile
-    def set_cur(self, t):
-        # only used after init to set frame number? 
-        # TODO: check behavior with missed frames. Need to append blank I think
-        self.cur = t % self.max_
 
 
 #%%
